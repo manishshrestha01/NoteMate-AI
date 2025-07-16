@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.env/
+venv/
+*.h5
+*.ckpt
+data/
+models/
+backend/venv/
+backend/.env
+frontend/node_modules/
+.DS_Store
