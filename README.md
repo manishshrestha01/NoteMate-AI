@@ -43,18 +43,21 @@ Built with a **React + Tailwind CSS frontend** and a **Python FastAPI backend**,
 ```bash
 git clone <your-repository-url>
 cd <project-folder>
-
+```
 # Remove old venv (optional)
+```bash
 rm -rf venv
-
+```
 # Create venv (adjust Python path if needed)
+```bash
 python3.11 -m venv venv
-
+```
 # Activate
+```bash
 source venv/bin/activate
-
+```
 3️⃣ Install backend dependencies
-bash
+```bash
 pip install fastapi "uvicorn[standard]" python-multipart \
 PyPDF2==3.0.1 python-docx==1.1.0 python-magic==0.4.27 \
 python-dotenv==1.0.0 sqlalchemy==2.0.23 loguru==0.7.2 \
@@ -62,22 +65,20 @@ python-json-logger==2.0.7 pytest==7.4.3 pytest-asyncio==0.21.1 \
 "python-jose[cryptography]==3.3.0" requests httpx chromadb \
 sentence-transformers langchain langchain-community langchain-chroma \
 pandas numpy scipy pydantic pydantic-settings transformers torch
+```
 ▶️ Running the Application
 🚀 Start the backend
-bash
-Copy
-Edit
+```bash
 uvicorn main:app --reload
+```
 Default: http://127.0.0.1:8000
 
 💻 Start the frontend
 From your frontend folder:
-
-bash
-Copy
-Edit
+```bash
 npm install
 npm run dev
+```
 Default: http://localhost:5173
 
 🧪 Usage (prototype)
@@ -90,15 +91,14 @@ Select desired units/topics.
 Click Generate Notes (backend AI note generation to be added).
 
 📦 Project Structure (conceptual)
-bash
-Copy
-Edit
+```bash
 /src
   ├─ App.js                # Main React app
   └─ ChapterSelection.js   # Syllabus display & selection
 /backend
   └─ main.py               # FastAPI entry point
 /venv                      # Python virtual environment
+```
 🚀 Future Enhancements
 ✅ Robust PDF parsing
 ✅ AI-powered, personalized notes
