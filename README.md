@@ -1,4 +1,4 @@
-# 📚 Syllabus Notes Generator
+# 📚 NoteMate AI
 
 A modern web application that helps students **generate study notes directly from their course syllabi**.  
 Built with a **React + Tailwind CSS frontend** and a **Python FastAPI backend**, it combines modern UI with AI-powered note generation (planned).
