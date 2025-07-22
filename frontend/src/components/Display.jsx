@@ -1,6 +1,4 @@
 import React from 'react';
-
-// IMPORTANT: Add 'onBackToSyllabus' to the destructured props
 const Display = ({ notes, onReset, fileName, onBackToSyllabus }) => {
   return (
     <div className="bg-white p-8 rounded-2xl shadow-xl border border-gray-100">

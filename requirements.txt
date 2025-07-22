@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+python-magic
+PyMuPDF
+langchain
+langchain-community
+sentence-transformers
+chromadb
+llama-cpp-python
+requests
+numpy
+transformers

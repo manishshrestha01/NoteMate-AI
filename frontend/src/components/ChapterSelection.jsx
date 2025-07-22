@@ -178,7 +178,7 @@ function ChapterSelection({ unitsData, onGenerateNotes, onReset, fileName, isLoa
                 : 'bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500'
             }`}
           >
-            {isLoadingNotes ? 'Generating Notes...' : `Generate Notes (${selectedTopics.length})`}
+            {isLoadingNotes ? 'Generating with Internet...' : `Generate with Internet (${selectedTopics.length})`}
           </button>
           <button
             onClick={handleGenerateAiClick}
