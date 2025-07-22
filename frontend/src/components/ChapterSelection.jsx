@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 
-function ChapterSelection({ unitsData, onGenerateNotes, onReset, fileName, isLoadingNotes }) {
+function ChapterSelection({ unitsData, onGenerateNotes, onReset, fileName, isLoadingNotes, onGenerateAiNotes }) {
   // State to store which topics (unit titles or sub-unit titles) are selected for notes generation
   const [selectedTopics, setSelectedTopics] = useState([]);
   // State to manage which unit's content is currently open/expanded
@@ -14,12 +14,27 @@ function ChapterSelection({ unitsData, onGenerateNotes, onReset, fileName, isLoa
 
   // Handle checkbox change for selecting topics for notes generation
   // This now needs to handle both unit titles and sub-unit titles
-  const handleCheckboxChange = (topicTitle) => {
-    setSelectedTopics((prevSelectedTopics) =>
-      prevSelectedTopics.includes(topicTitle)
-        ? prevSelectedTopics.filter((title) => title !== topicTitle)
-        : [...prevSelectedTopics, topicTitle]
-    );
+  const handleCheckboxChange = (topicTitle, isUnit = false, unitIndex = null) => {
+    setSelectedTopics((prevSelectedTopics) => {
+      if (isUnit && unitIndex !== null) {
+        const unit = unitsData[unitIndex];
+        const subUnitTitles = unit.sub_units ? unit.sub_units.map(su => su.title) : [];
+        const allTitles = [unit.title, ...subUnitTitles];
+        const isSelected = prevSelectedTopics.includes(unit.title);
+        if (isSelected) {
+          // Remove unit and all sub-units
+          return prevSelectedTopics.filter(title => !allTitles.includes(title));
+        } else {
+          // Add unit and all sub-units
+          return [...new Set([...prevSelectedTopics, ...allTitles])];
+        }
+      } else {
+        // Toggle individual topic (sub-unit or unit)
+        return prevSelectedTopics.includes(topicTitle)
+          ? prevSelectedTopics.filter((title) => title !== topicTitle)
+          : [...prevSelectedTopics, topicTitle];
+      }
+    });
   };
 
   // Toggle the visibility of a unit's content
@@ -29,6 +44,12 @@ function ChapterSelection({ unitsData, onGenerateNotes, onReset, fileName, isLoa
 
   const handleGenerateClick = () => {
     onGenerateNotes(selectedTopics);
+  };
+
+  const handleGenerateAiClick = () => {
+    if (typeof onGenerateAiNotes === 'function') {
+      onGenerateAiNotes(selectedTopics);
+    }
   };
 
   return (
@@ -63,7 +84,7 @@ function ChapterSelection({ unitsData, onGenerateNotes, onReset, fileName, isLoa
                     type="checkbox"
                     id={`unit-${unitIndex}`}
                     checked={selectedTopics.includes(unit.title)}
-                    onChange={() => handleCheckboxChange(unit.title)}
+                    onChange={() => handleCheckboxChange(unit.title, true, unitIndex)}
                     className="form-checkbox h-5 w-5 text-blue-600 rounded-md focus:ring-blue-500 transition duration-150 ease-in-out mr-4 flex-shrink-0"
                     onClick={(e) => e.stopPropagation()} // Prevent expansion when clicking checkbox
                   />
@@ -147,17 +168,30 @@ function ChapterSelection({ unitsData, onGenerateNotes, onReset, fileName, isLoa
         >
           Upload New Syllabus
         </button>
-        <button
-          onClick={handleGenerateClick}
-          disabled={selectedTopics.length === 0 || isLoadingNotes}
-          className={`px-8 py-3 rounded-lg text-white font-semibold transition duration-150 ease-in-out shadow-md ${
-            selectedTopics.length === 0 || isLoadingNotes
-              ? 'bg-blue-300 cursor-not-allowed'
-              : 'bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500'
-          }`}
-        >
-          {isLoadingNotes ? 'Generating Notes...' : `Generate Notes (${selectedTopics.length})`}
-        </button>
+        <div className="flex gap-4">
+          <button
+            onClick={handleGenerateClick}
+            disabled={selectedTopics.length === 0 || isLoadingNotes}
+            className={`px-8 py-3 rounded-lg text-white font-semibold transition duration-150 ease-in-out shadow-md ${
+              selectedTopics.length === 0 || isLoadingNotes
+                ? 'bg-blue-300 cursor-not-allowed'
+                : 'bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500'
+            }`}
+          >
+            {isLoadingNotes ? 'Generating Notes...' : `Generate Notes (${selectedTopics.length})`}
+          </button>
+          <button
+            onClick={handleGenerateAiClick}
+            disabled={selectedTopics.length === 0 || isLoadingNotes}
+            className={`px-8 py-3 rounded-lg text-white font-semibold transition duration-150 ease-in-out shadow-md ${
+              selectedTopics.length === 0 || isLoadingNotes
+                ? 'bg-green-300 cursor-not-allowed'
+                : 'bg-green-600 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500'
+            }`}
+          >
+            {isLoadingNotes ? 'Generating with AI...' : `Generate with AI (${selectedTopics.length})`}
+          </button>
+        </div>
       </div>
     </div>
   );

@@ -1,4 +1,3 @@
-// src/App.jsx
 import React, { useState } from 'react';
 import UploadForm from "./components/UploadForm";
 import Navbar from "./components/Navbar";
@@ -10,7 +9,7 @@ function App() {
   const [currentView, setCurrentView] = useState('upload'); // 'upload', 'selectChapters', 'displayNotes'
   const [selectedFile, setSelectedFile] = useState(null);
   const [uploadedFileName, setUploadedFileName] = useState('');
-  const [currentSyllabusId, setCurrentSyllabusId] = useState(null); // <--- NEW: State to store the syllabus_id
+  const [currentSyllabusId, setCurrentSyllabusId] = useState(null);
 
   // --- UI Feedback States ---
   const [uploadLoading, setUploadLoading] = useState(false); // For PDF upload process
@@ -36,7 +35,7 @@ function App() {
     setCurrentView('upload');
     setSelectedFile(null);
     setUploadedFileName('');
-    setCurrentSyllabusId(null); // <--- NEW: Reset syllabus ID
+    setCurrentSyllabusId(null);
     setUploadLoading(false);
     setNotesLoading(false);
     setUploadError('');
@@ -88,9 +87,8 @@ function App() {
 
       if (response.ok) {
         const data = await response.json();
-        // Assuming backend returns units_data and syllabus_id
         setExtractedChapters(data.units_data || []);
-        setCurrentSyllabusId(data.syllabus_id); // <--- NEW: Store the syllabus_id
+        setCurrentSyllabusId(data.syllabus_id);
         setCurrentView('selectChapters'); // Move to chapter selection view
       } else {
         const errorData = await response.json();
@@ -111,21 +109,14 @@ function App() {
       return;
     }
 
-    // You can choose the source type here. For now, we'll default to 'syllabus'.
-    // If you add a UI element to switch between 'syllabus' and 'internet',
-    // you would pass that value here.
     const sourceType = 'syllabus'; // Defaulting to syllabus for now
 
-    // IMPORTANT: Construct the request body as a JSON object
     const requestBody = {
       topics: selectedTopics,
       source_type: sourceType,
-      // syllabus_id is REQUIRED if sourceType is 'syllabus'
       ...(sourceType === 'syllabus' && { syllabus_id: currentSyllabusId }),
-      // You could add an 'internet_search_query' field if source_type is 'internet' and you want to customize the search
     };
 
-    // Basic validation for syllabus_id if source type is syllabus
     if (sourceType === 'syllabus' && !currentSyllabusId) {
         setUploadError('Syllabus ID is missing. Please upload a syllabus first.');
         return;
@@ -142,16 +133,16 @@ function App() {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(requestBody), // <--- CORRECTED: Send the full requestBody object
+        body: JSON.stringify(requestBody),
       });
 
       if (response.ok) {
         const data = await response.json();
-        setGeneratedStudyNotes(data.notes || []); // Assuming backend returns { "notes": [...] }
+        setGeneratedStudyNotes(data.notes || []);
         setCurrentView('displayNotes'); // Move to notes display view
       } else {
         const errorData = await response.json();
-        console.error('Backend Error Response:', errorData); // Log error for debugging
+        console.error('Backend Error Response:', errorData);
         setUploadError(errorData.detail || 'Unknown error occurred during note generation.');
       }
     } catch (error) {
@@ -162,6 +153,55 @@ function App() {
     }
   };
 
+  // --- NEW: Function to go back from 'displayNotes' to 'selectChapters' ---
+  const handleBackToSyllabusSelection = () => {
+    setCurrentView('selectChapters');
+    // Optionally clear generated notes when going back, if you want
+    setGeneratedStudyNotes([]);
+  };
+
+  // Handles the generation of AI notes based on selected chapters
+  const handleGenerateAiNotes = async (selectedTopics) => {
+    if (selectedTopics.length === 0) {
+      setUploadError('Please select at least one chapter to generate notes.');
+      return;
+    }
+    if (!currentSyllabusId) {
+      setUploadError('Syllabus ID is missing. Please upload a syllabus first.');
+      return;
+    }
+
+    setNotesLoading(true);
+    setUploadError('');
+    setGeneratedStudyNotes([]);
+
+    const requestBody = {
+      topics: selectedTopics,
+      source_type: 'syllabus',
+      syllabus_id: currentSyllabusId,
+    };
+
+    try {
+      const response = await fetch('http://127.0.0.1:8000/generate-ai-notes/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        setGeneratedStudyNotes(data);
+        setCurrentView('displayNotes');
+      } else {
+        const errorData = await response.json();
+        setUploadError(errorData.detail || 'Unknown error occurred during AI note generation.');
+      }
+    } catch (error) {
+      setUploadError(`An error occurred: ${error.message}`);
+    } finally {
+      setNotesLoading(false);
+    }
+  };
 
   // --- Drag and Drop Handlers (passed to UploadForm) ---
   const onDragEnter = (e) => { e.preventDefault(); e.stopPropagation(); setDragActive(true); };
@@ -200,7 +240,8 @@ function App() {
             <ChapterSelection
               unitsData={extractedChapters}
               onGenerateNotes={handleGenerateNotes}
-              onReset={resetAllStates}
+              onGenerateAiNotes={handleGenerateAiNotes}
+              onReset={resetAllStates} // Use resetAllStates to go back to upload
               fileName={uploadedFileName}
               isLoadingNotes={notesLoading}
             />
@@ -209,8 +250,10 @@ function App() {
           {currentView === 'displayNotes' && (
             <Display
               notes={generatedStudyNotes}
-              onReset={resetAllStates}
+              onReset={resetAllStates} // This button will take user to 'upload' view
               fileName={uploadedFileName}
+              // --- NEW PROP: Pass the back handler to Display component ---
+              onBackToSyllabus={handleBackToSyllabusSelection}
             />
           )}
         </div>

@@ -1,4 +1,3 @@
-// src/components/UploadForm.jsx
 import React, { useRef } from 'react';
 
 const UploadForm = ({ onFileUpload, loading, error, dragActive, onDragEnter, onDragLeave, onDragOver, onDrop, supportedFormats }) => {
