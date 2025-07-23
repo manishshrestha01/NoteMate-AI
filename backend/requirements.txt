@@ -1,4 +1,5 @@
 fastapi
+mangum
 uvicorn
 pydantic
 pydantic-settings
@@ -8,7 +9,6 @@ numpy
 requests
 langchain
 langchain-community
-transformers
-llama-cpp-python
+sentence-transformers
 chromadb
-mangum
+llama-cpp-python
