@@ -190,7 +190,7 @@ def get_llama_model() -> Optional[Llama]:
     if _llama_instance is not None:
         return _llama_instance
 
-    # Only use Phi-2
+    # Phi-2 Model
     phi2_path = str(Path(__file__).parent / "models/phi-2.Q4_0.gguf")
     if Path(phi2_path).exists():
         model_path = phi2_path
@@ -422,7 +422,7 @@ async def process_syllabus(file: UploadFile = File(...)):
 @app.post(
     "/generate-notes/",
     response_model=NoteLinksResponse,
-    summary="Generate top 3 best note links by comparing syllabus context with internet search"
+    summary="Generate top 3 best note links by comparing syllabus context with internet search and LLM validation"
 )
 async def generate_notes(request: GenerateNotesRequest):
     topics = request.topics
@@ -436,262 +436,116 @@ async def generate_notes(request: GenerateNotesRequest):
     if Google_Search is None:
         raise HTTPException(status_code=500, detail="Google Search API is not initialized. Check GOOGLE_API_KEY and GOOGLE_CSE_ID in your .env file.")
 
+    llm = get_llama_model()
+    if llm is None:
+        raise HTTPException(status_code=503, detail="Local LLM model is not available.")
+
     generated_links = []
 
     for topic in topics:
         try:
-            # Step 1: get syllabus context (if syllabus_id provided)
-            syllabus_context_text = topic # Default to topic itself if no syllabus context
+            # 1. get syllabus context
+            syllabus_context = topic
             if source_type == "syllabus" and syllabus_id:
-                docs = vector_store.similarity_search(
-                    query=topic,
-                    k=3, # Retrieve top 3 relevant chunks
-                    filter={"syllabus_id": syllabus_id} # Filter by the specific syllabus
-                )
+                docs = vector_store.similarity_search(query=topic, k=3, filter={"syllabus_id": syllabus_id})
                 if docs:
-                    syllabus_context_text = "\n".join([doc.page_content for doc in docs]).strip()
+                    syllabus_context = "\n".join([doc.page_content for doc in docs]).strip()
                 else:
-                    logger.warning(f"No relevant chunks found in ChromaDB for syllabus_id {syllabus_id} and topic '{topic}'. Using topic as context.")
+                    logger.warning(f"No relevant chunks found for topic '{topic}'. Using topic as context.")
 
+            # 2. get search results
+            search_results_raw = Google_Search.results(topic, num_results=10)
+            search_results = [res for res in search_results_raw if res.get('link') and res.get('snippet')]
 
-            # Compute embedding for syllabus context
-            syllabus_embedding = embeddings.embed_query(syllabus_context_text)
-
-            # Step 2: run programmable search (get results)
-            search_results_raw = Google_Search.results(topic, num_results=10) # Get up to 10 results
-            
-            # Filter out potentially bad results (e.g., no link or snippet)
-            search_results = [
-                res for res in search_results_raw 
-                if res.get('link') and res.get('snippet')
-            ]
-
+            # 3. compute similarity
+            syllabus_embedding = embeddings.embed_query(syllabus_context)
             scored_results = []
-            for result in search_results:
-                external_text = f"{result.get('title', '')} {result.get('snippet', '')}"
-                external_embedding = embeddings.embed_query(external_text)
+            for res in search_results:
+                snippet = f"{res.get('title','')} {res.get('snippet','')}"
+                external_embedding = embeddings.embed_query(snippet)
                 score = cosine_similarity(syllabus_embedding, external_embedding)
-                scored_results.append((score, result))
+                scored_results.append((score, res))
 
-            # Step 3: sort results by similarity descending
+            # sort by similarity
             scored_results.sort(key=lambda x: x[0], reverse=True)
+            top_results = scored_results[:10]  # take top 10 for validation
 
-            # Step 4: take top 3 results
-            top_results = scored_results[:3]
+            validated_links = []
+            for score, res in top_results:
+                snippet = res.get('snippet', '')
+                url = res.get('link', '#')
 
-            # Step 5: add them to response list
-            if top_results:
+                # optional: skip non-edu
+                if not (".edu" in url or ".ac." in url):
+                    continue
+
+                # 4. validate with local LLM
+                prompt = f"""
+We found this snippet for topic '{topic}': 
+
+\"{snippet}\"
+
+Is this snippet useful and relevant for a university student learning '{topic}'? Answer strictly with yes or no.
+"""
+                try:
+                    answer = llm(prompt, stop=["```", "</s>"]).strip().lower()
+                    logger.debug(f"Validation answer for topic '{topic}': {answer}")
+                    if "yes" in answer or "useful" in answer:
+                        validated_links.append(NoteLink(
+                            topic=topic,
+                            title=res.get('title', f"Result for {topic}"),
+                            snippet=snippet,
+                            url=url,
+                            similarity_score=round(score, 3)
+                        ))
+                except Exception as e:
+                    logger.error(f"Validation failed for topic '{topic}': {e}")
+
+            # Always return 3 notes per topic
+            notes_for_topic = []
+            # Add up to 3 validated links
+            notes_for_topic.extend(validated_links[:3])
+            # If less than 3, fill with top scoring results (even if not validated)
+            if len(notes_for_topic) < 3:
+                # Get the top results not already in validated_links
+                used_urls = set(n.url for n in notes_for_topic)
                 for score, res in top_results:
-                    generated_links.append(NoteLink(
+                    url = res.get('link', '#')
+                    if url in used_urls:
+                        continue
+                    notes_for_topic.append(NoteLink(
                         topic=topic,
                         title=res.get('title', f"Result for {topic}"),
                         snippet=res.get('snippet', ''),
-                        url=res.get('link', '#'),
+                        url=url,
                         similarity_score=round(score, 3)
                     ))
-            else:
-                # If no good search results were found or filtered out
-                generated_links.append(NoteLink(
+                    used_urls.add(url)
+                    if len(notes_for_topic) == 3:
+                        break
+            # If still less than 3, add placeholders
+            while len(notes_for_topic) < 3:
+                notes_for_topic.append(NoteLink(
                     topic=topic,
-                    title=f"No relevant internet notes found for {topic}",
-                    snippet="No highly similar content found online after search.",
+                    title="No internet notes found",
+                    snippet="",
                     url="#",
                     similarity_score=0
                 ))
+            generated_links.extend(notes_for_topic)
 
         except Exception as e:
             logger.error(f"Error generating note for topic '{topic}': {e}", exc_info=True)
-            generated_links.append(NoteLink(
-                topic=topic,
-                title=f"Error generating note for {topic}",
-                snippet=f"Unexpected error: {e}",
-                url="#error",
-                similarity_score=0
-            ))
+            for _ in range(3):
+                generated_links.append(NoteLink(
+                    topic=topic,
+                    title=f"Error generating note for {topic}",
+                    snippet=f"Unexpected error: {e}",
+                    url="#error",
+                    similarity_score=0
+                ))
 
     return NoteLinksResponse(notes=generated_links)
-
-    topics = request.topics
-    syllabus_id = request.syllabus_id
-    source_type = request.source_type
-
-    if not topics:
-        raise HTTPException(status_code=400, detail="No topics provided.")
-    if source_type == "syllabus" and not syllabus_id:
-        raise HTTPException(status_code=400, detail="syllabus_id is required when source_type is 'syllabus'.")
-
-    llm = get_llama_model()
-    if llm is None:
-        raise HTTPException(status_code=503, detail="Local LLM is not available.")
-
-    result_links = []
-
-    for topic in topics:
-        try:
-            # 1. Get context
-            syllabus_context = topic
-            if source_type == "syllabus" and syllabus_id:
-                docs = vector_store.similarity_search(
-                    query=topic, k=3, filter={"syllabus_id": syllabus_id}
-                )
-                if docs:
-                    syllabus_context = "\n".join([doc.page_content for doc in docs]).strip()
-                else:
-                    syllabus_context = "This is a computer science topic. Generate helpful study notes."
-
-            # 2. Build prompt
-            prompt = f"""
-You are a subject expert writing study notes.
-
-Instructions:
-- Write clear, structured notes in paragraph form.
-- Start with a definition or overview.
-- Explain subtopics or concepts with short examples.
-- Avoid lists or markdown formatting unless necessary.
-- Write in a tone suited for a university-level student.
-- Do NOT include any meta-text like "Your task is..." or "Textbook:".
-
-Context (optional for reference):
-{syllabus_context}
-
-Please begin the notes below:
-"""
-
-            # 3. Call LLM
-            try:
-                response = llm(prompt, stop=["```", "</s>"])
-            except Exception as e:
-                raise ValueError(f"LLM call failed: {e}")
-
-            # 4. Handle both str and dict formats
-            if isinstance(response, dict) and "choices" in response:
-                output = response["choices"][0]["text"]
-            elif isinstance(response, str):
-                output = response
-            else:
-                raise ValueError("Unexpected LLM response format")
-
-            output = output.strip()
-
-            # 5. Fallback for short or empty output
-            if len(output.split()) < 20:
-                logger.warning(f"Short or empty output for topic '{topic}':\n{output}")
-                output = f"(⚠️ Auto-generated note is too brief or unavailable for topic: '{topic}')"
-
-            # 6. Save to file
-            note_id = str(uuid.uuid4())
-            filename = f"{note_id}.md"
-            note_path = NOTES_DIR / filename
-
-            with open(note_path, "w", encoding="utf-8") as f:
-                f.write(f"# Notes for {topic}\n\n{output}\n")
-
-            # 7. Add to result
-            result_links.append({
-                "topic": topic,
-                "note_id": note_id,
-                "download_url": f"/download-note/{note_id}"
-            })
-
-        except Exception as e:
-            logger.error(f"Failed to generate notes for topic '{topic}': {e}", exc_info=True)
-            result_links.append({
-                "topic": topic,
-                "note_id": None,
-                "error": str(e)
-            })
-
-    return result_links
-    
-    topics = request.topics
-    syllabus_id = request.syllabus_id
-    source_type = request.source_type
-
-    if not topics:
-        raise HTTPException(status_code=400, detail="No topics provided.")
-    if source_type == "syllabus" and not syllabus_id:
-        raise HTTPException(status_code=400, detail="syllabus_id is required when source_type is 'syllabus'.")
-
-    llm = get_llama_model()
-    if llm is None:
-        raise HTTPException(status_code=503, detail="Local LLM is not available.")
-
-    result_links = []
-
-    for topic in topics:
-        try:
-            # 1. Get context
-            syllabus_context = topic
-            if source_type == "syllabus" and syllabus_id:
-                docs = vector_store.similarity_search(
-                    query=topic, k=3, filter={"syllabus_id": syllabus_id}
-                )
-                if docs:
-                    syllabus_context = "\n".join([doc.page_content for doc in docs]).strip()
-
-            # 2. Build prompt
-            prompt = f"""
-You are a subject expert writing study notes.
-
-Instructions:
-- Write clear, structured notes in paragraph form.
-- Start with a definition or overview.
-- Explain subtopics or concepts with short examples.
-- Avoid lists or markdown formatting unless necessary.
-- Write in a tone suited for a university-level student.
-- Do NOT include any meta-text like "Your task is..." or "Textbook:".
-
-Context (optional for reference):
-{syllabus_context}
-
-Please begin the notes below:
-"""
-
-            # 3. Generate using LLM
-            try:
-                response = llm(prompt, stop=["```", "</s>"])
-            except Exception as e:
-                raise ValueError(f"LLM call failed: {e}")
-
-            # 4. Handle response format
-            if isinstance(response, dict) and "choices" in response:
-                output = response["choices"][0]["text"]
-            elif isinstance(response, str):
-                output = response
-            else:
-                raise ValueError("Unexpected LLM response format")
-
-            output = output.strip()
-
-            # Optional: Guard against very short/incomplete notes
-            if len(output.split()) < 20:
-                raise ValueError("LLM generated output is too short or empty.")
-
-            # 5. Save to file
-            note_id = str(uuid.uuid4())
-            filename = f"{note_id}.md"
-            note_path = NOTES_DIR / filename
-
-            with open(note_path, "w", encoding="utf-8") as f:
-                f.write(f"# Notes for {topic}\n\n{output}\n")
-
-            # 6. Return link
-            result_links.append({
-                "topic": topic,
-                "note_id": note_id,
-                "download_url": f"/download-note/{note_id}"
-            })
-
-        except Exception as e:
-            logger.error(f"Failed to generate notes for topic '{topic}': {e}", exc_info=True)
-            result_links.append({
-                "topic": topic,
-                "note_id": None,
-                "error": str(e)
-            })
-
-    return result_links
-
 
 @app.post("/generate-ai-notes/")
 async def generate_ai_notes(request: GenerateNotesRequest):

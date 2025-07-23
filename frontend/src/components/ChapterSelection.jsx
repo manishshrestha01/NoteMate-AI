@@ -178,9 +178,9 @@ function ChapterSelection({ unitsData, onGenerateNotes, onReset, fileName, isLoa
                 : 'bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500'
             }`}
           >
-            {isLoadingNotes ? 'Generating with Internet...' : `Generate with Internet (${selectedTopics.length})`}
+            {isLoadingNotes ? 'Generating Notes...' : `Generate Notes (${selectedTopics.length})`}
           </button>
-          <button
+          {/* <button
             onClick={handleGenerateAiClick}
             disabled={selectedTopics.length === 0 || isLoadingNotes}
             className={`px-8 py-3 rounded-lg text-white font-semibold transition duration-150 ease-in-out shadow-md ${
@@ -190,7 +190,7 @@ function ChapterSelection({ unitsData, onGenerateNotes, onReset, fileName, isLoa
             }`}
           >
             {isLoadingNotes ? 'Generating with AI...' : `Generate with AI (${selectedTopics.length})`}
-          </button>
+          </button> */}
         </div>
       </div>
     </div>
