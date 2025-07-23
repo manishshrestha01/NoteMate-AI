@@ -4,11 +4,11 @@ pydantic
 pydantic-settings
 python-magic
 PyMuPDF
+numpy
+requests
 langchain
 langchain-community
-sentence-transformers
-chromadb
-llama-cpp-python
-requests
-numpy
 transformers
+llama-cpp-python
+chromadb
+mangum
