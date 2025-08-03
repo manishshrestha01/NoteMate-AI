@@ -1,7 +1,8 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, status, Depends
+# main.py
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List, Optional, Dict, Any, Literal
@@ -13,57 +14,51 @@ import logging
 import re
 import json
 import uuid
-import numpy as np # Added for cosine_similarity
-import sys # Added for error handling insights
-
-from transformers import AutoTokenizer # Unused but kept if you plan to use it
 
 # Document Loaders for text extraction
-import fitz  # PyMuPDF for better PDF text extraction
+from PyPDF2 import PdfReader
 
 # LangChain components for text splitting, embeddings, vector store, LLM
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_community.vectorstores import Chroma
-from langchain_community.utilities import GoogleSearchAPIWrapper # Added missing import
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel as LCBaseModel
+from pydantic import Field as LCField
 
-# TinyLlama for syllabus extraction
-from llama_cpp import Llama
-from functools import lru_cache # For singleton model loading
-
-import requests  # For Ollama API call
-
-NOTES_DIR = Path("generated_notes")
-NOTES_DIR.mkdir(parents=True, exist_ok=True)
+# Google Search Tool
+from langchain_community.utilities import GoogleSearchAPIWrapper
+from langchain_core.messages import HumanMessage
 
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # --- Pydantic Schemas for AI Extraction Output (Syllabus Structure) ---
-class SubUnit(BaseModel):
-    title: str = Field(description="The title of the sub-unit, e.g., '1.1 Types', '2.3 Interprocess Communication'.")
-    content: str = Field(description="The full textual content of this sub-unit.")
+class SubUnit(LCBaseModel):
+    title: str = LCField(description="The title of the sub-unit, e.g., '1.1 Types', '2.3 Interprocess Communication'.")
+    content: str = LCField(description="The full textual content of this sub-unit.")
 
-class Unit(BaseModel):
-    title: str = Field(description="The title of the main unit, e.g., 'Unit 1: Introduction', 'Chapter 2: Processes'.")
-    content: str = Field(description="The full textual content of this main unit, excluding content explicitly within its sub-units. Can be empty if all content is within sub-units.")
-    sub_units: List[SubUnit] = Field(default_factory=list, description="A list of sub-units within this main unit.")
+class Unit(LCBaseModel):
+    title: str = LCField(description="The title of the main unit, e.g., 'Unit 1: Introduction', 'Chapter 2: Processes'.")
+    content: str = LCField(description="The full textual content of this main unit, excluding content explicitly within its sub-units. Can be empty if all content is within sub-units.")
+    sub_units: List[SubUnit] = LCField(default_factory=list, description="A list of sub-units within this main unit.")
 
-class SyllabusStructure(BaseModel):
-    units_data: List[Unit] = Field(description="A list of main units found in the syllabus, each with its title, content, and nested sub-units.")
+class SyllabusStructure(LCBaseModel):
+    units_data: List[Unit] = LCField(description="A list of main units found in the syllabus, each with its title, content, and nested sub-units.")
 
-# --- Pydantic Schemas for Generated Notes Link Output ---
-class NoteLink(BaseModel):
-    topic: str
-    title: str
-    snippet: str
-    url: str
-    similarity_score: float
+# --- Pydantic Schemas for AI Generated Notes Output ---
+class GeneratedNote(LCBaseModel):
+    topicTitle: str = LCField(description="The main topic/chapter title this note relates to (e.g., 'Introduction to React').")
+    title: str = LCField(description="A concise title for the generated resource/note (e.g., 'Official React Docs').")
+    snippet: str = LCField(description="A brief summary or excerpt of the resource content.")
+    url: str = LCField(description="A placeholder or dummy URL for the resource. In a real app, this would come from a web search API.")
+    source: str = LCField(description="The type of source (e.g., 'educational', 'github', 'article', 'video', 'web_search').")
 
-class NoteLinksResponse(BaseModel):
-    notes: List[NoteLink]
+class GeneratedNotesList(LCBaseModel):
+    notes: List[GeneratedNote] = LCField(description="A list of generated notes/resources for the given topics.")
 
 # --- Pydantic Schema for Generate Notes Request ---
 class GenerateNotesRequest(BaseModel):
@@ -77,11 +72,16 @@ class GenerateNotesRequest(BaseModel):
         description="Specifies where to find the notes: 'syllabus' (from uploaded PDF) or 'internet' (using Google Search)."
     )
 
+
 # --- Settings Management ---
 class Settings(BaseSettings):
     chroma_db_path: str = "./chroma_db"
     supported_file_types: List[str] = ["application/pdf"]
     upload_dir: str = "uploaded_files"
+
+    gemini_api_key: Optional[str] = None
+    gemini_extraction_model_name: str = "gemini-1.5-flash"
+    gemini_notes_generation_model_name: str = "gemini-1.5-flash"
 
     google_api_key: Optional[str] = None
     google_cse_id: Optional[str] = None
@@ -106,6 +106,33 @@ logger.info("SentenceTransformerEmbeddings model 'all-MiniLM-L6-v2' initialized.
 vector_store = Chroma(persist_directory=settings.chroma_db_path, embedding_function=embeddings)
 logger.info(f"ChromaDB initialized, persistent directory: {settings.chroma_db_path}")
 
+
+# Initialize Gemini LLM for Extraction
+extraction_llm = None
+if settings.gemini_api_key:
+    extraction_llm = ChatGoogleGenerativeAI(
+        model=settings.gemini_extraction_model_name,
+        temperature=0.1,
+        google_api_key=settings.gemini_api_key,
+        convert_system_message_to_human=True
+    )
+    logger.info(f"Extraction LLM (Gemini) initialized with model: {settings.gemini_extraction_model_name}")
+else:
+    logger.error("Gemini API key is missing. AI syllabus extraction will be disabled.")
+
+# Initialize Gemini LLM for Notes Generation (can be the same model or different)
+notes_generation_llm = None
+if settings.gemini_api_key:
+    notes_generation_llm = ChatGoogleGenerativeAI(
+        model=settings.gemini_notes_generation_model_name,
+        temperature=0.7,
+        google_api_key=settings.gemini_api_key,
+        convert_system_message_to_human=True
+    )
+    logger.info(f"Notes Generation LLM (Gemini) initialized with model: {settings.gemini_notes_generation_model_name}")
+else:
+    logger.error("Gemini API key is missing. AI note generation will be disabled.")
+
 # --- Initialize Google Search Tool ---
 Google_Search = None
 if settings.google_api_key and settings.google_cse_id:
@@ -119,6 +146,7 @@ if settings.google_api_key and settings.google_cse_id:
         Google_Search = None
 else:
     logger.warning("Google API Key or CSE ID missing. Internet search functionality will be unavailable.")
+
 
 app = FastAPI(
     title="NoteMate Backend - Syllabus & Notes Processor",
@@ -144,7 +172,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Helper Functions ---
+# --- Helper Functions for Document Processing and AI Interaction ---
 
 def get_file_type(file_path: str) -> str:
     return magic.from_file(file_path, mime=True)
@@ -152,180 +180,67 @@ def get_file_type(file_path: str) -> str:
 def extract_text_from_pdf(pdf_path: str) -> str:
     text = ""
     try:
-        with fitz.open(pdf_path) as doc:
-            for page in doc:
-                text += page.get_text()
+        with open(pdf_path, "rb") as file:
+            reader = PdfReader(file)
+            for page in reader.pages:
+                text += page.extract_text() or ""
     except Exception as e:
-        logger.error(f"Error extracting text from PDF {pdf_path} with fitz: {e}")
+        logger.error(f"Error extracting text from PDF {pdf_path}: {e}")
         raise HTTPException(status_code=500, detail=f"Error extracting text from PDF: {e}")
     return text
 
-def preprocess_syllabus_text(text: str) -> str:
-    lines = [line.rstrip() for line in text.splitlines()]
-    merged_lines = []
-    buffer = ""
-    for line in lines:
-        if not line.strip():
-            if buffer:
-                merged_lines.append(buffer)
-                buffer = ""
-            continue
-        # If buffer is not empty and current line is a continuation (doesn't start with Unit/Chapter/Module/number)
-        if buffer and not re.match(r'^(Unit|Chapter|Module|\d+\.\d+)', line.strip(), re.IGNORECASE):
-            buffer += " " + line.strip()
-        else:
-            if buffer:
-                merged_lines.append(buffer)
-            buffer = line.strip()
-    if buffer:
-        merged_lines.append(buffer)
-    return "\n".join(merged_lines)
+def extract_syllabus_structure_with_llm(syllabus_text: str) -> SyllabusStructure:
+    """
+    Extracts units and sub-units from syllabus text using a Gemini LLM.
+    """
+    if extraction_llm is None:
+        raise HTTPException(
+            status_code=500,
+            detail="AI extraction LLM (Gemini) is not initialized. Please ensure GEMINI_API_KEY is set in .env."
+        )
 
-# Singleton loader for TinyLlama
-_llama_instance: Optional[Llama] = None
+    prompt_template = """
+    You are an expert syllabus parser. Your task is to extract the main units and their sub-units from the provided syllabus text.
+    Identify main units by clear headers like "Unit X:", "Chapter Y:", or "Module Z:".
+    Within each main unit, identify sub-units by numerical patterns like "1.1", "1.2.3", etc.
 
-@lru_cache(maxsize=1)
-def get_llama_model() -> Optional[Llama]:
-    global _llama_instance
-    if _llama_instance is not None:
-        return _llama_instance
+    For each unit and sub-unit, extract its exact title and its full textual content.
+    The 'content' field for a unit/sub-unit should include all text from its title line up to the next unit/sub-unit title, or the end of its enclosing section.
+    If a unit/sub-unit has no further specific content (e.g., only contains nested sub-units), its 'content' field should be an empty string.
 
-    # Phi-2 Model
-    phi2_path = str(Path(__file__).parent / "models/phi-2.Q4_0.gguf")
-    if Path(phi2_path).exists():
-        model_path = phi2_path
-        logger.info(f"Using Phi-2 model for extraction: {model_path}")
-    else:
-        logger.critical(f"Phi-2 model not found in models/. Please add phi-2.Q4_0.gguf.")
-        return None
+    If no units or sub-units are found, return an empty list for 'units_data'.
+
+    Syllabus Text:
+    ---
+    {syllabus_text}
+    ---
+    """
+
+    prompt = ChatPromptTemplate.from_template(prompt_template)
+
+    # Use .with_structured_output to ensure Pydantic model adherence
+    extraction_chain = prompt | extraction_llm.with_structured_output(SyllabusStructure)
 
     try:
-        _llama_instance = Llama(
-            model_path=model_path,
-            n_ctx=2048,
-            n_gpu_layers=-1,
-            verbose=True,
-        )
-        logger.info(f"Model loaded successfully from {model_path}.")
-        return _llama_instance
+        syllabus_structure = extraction_chain.invoke({"syllabus_text": syllabus_text})
+        logger.info("Successfully parsed syllabus structure with Gemini LLM.")
+        return syllabus_structure
+
+    except ValidationError as e:
+        logger.error(f"Pydantic validation failed for LLM output: {e}", exc_info=True)
+        # More detailed error for debugging
+        raise HTTPException(status_code=500, detail=f"LLM extraction failed: Invalid structure from AI. Error: {e.errors()}")
     except Exception as e:
-        logger.critical(f"Failed to load model: {e}", exc_info=True)
-        _llama_instance = None
-        return None
-
-def cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
-    """Compute the cosine similarity between two vectors."""
-    vec1 = np.array(vec1)
-    vec2 = np.array(vec2)
-    dot_product = np.dot(vec1, vec2)
-    norm_a = np.linalg.norm(vec1)
-    norm_b = np.linalg.norm(vec2)
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot_product / (norm_a * norm_b)
-
-#Hero of the code: extract_syllabus_structure_with_local_model
-def extract_syllabus_structure_with_local_model(syllabus_text: str, llm_instance: Optional[Llama]) -> SyllabusStructure:
-    """
-    Hybrid extraction: regex to get units/sub-units,
-    and remove unwanted trailing sections like 'List of Tutorials', etc.
-    Uses local LLM fallback if available.
-    """
-    logger.info("Starting hybrid syllabus extraction (regex + cleaning unwanted sections).")
-
-    # Define sections after which we should cut
-    unwanted_patterns = [
-        "List of Tutorials", "List of Practical", "Evaluation System and Students’ Responsibilities",
-        "Evaluation System", "Students’ Responsibilities", "Prescribed Books and References",
-        "Text Books", "References", "Practical Works", "Practical Work", "Practical"
-    ]
-
-    # Step 1: Cut text if unwanted section appears
-    for pattern in unwanted_patterns:
-        idx = syllabus_text.lower().find(pattern.lower())
-        if idx != -1:
-            syllabus_text = syllabus_text[:idx]
-            break
-
-    # Step 2: Find units
-    unit_regex = re.compile(r'^(Unit|Module|Chapter)\s+[\dIVXLCDM]+.*$', re.MULTILINE | re.IGNORECASE)
-    unit_matches = list(unit_regex.finditer(syllabus_text))
-
-    units = []
-
-    for idx, match in enumerate(unit_matches):
-        unit_title = match.group().strip()
-        start = match.end()
-        end = unit_matches[idx + 1].start() if idx + 1 < len(unit_matches) else len(syllabus_text)
-        unit_content = syllabus_text[start:end].strip()
-
-        # Remove trailing unwanted content in unit_content too
-        for pattern in unwanted_patterns:
-            cut = unit_content.lower().find(pattern.lower())
-            if cut != -1:
-                unit_content = unit_content[:cut].strip()
-                break
-
-        # Step 3: Find sub-units
-        subunit_regex = re.compile(r'^\s*(\d+\.\d+)\s*(.+)', re.MULTILINE)
-        sub_units = []
-        for sub_match in subunit_regex.finditer(unit_content):
-            sub_number = sub_match.group(1).strip()
-            sub_title_text = sub_match.group(2).strip()
-            # Optional clean: remove trailing commentary like ● Understand
-            sub_title_clean = re.split(r'●|•|- Understand|- Review', sub_title_text)[0].strip()
-            sub_units.append(SubUnit(title=f"{sub_number} {sub_title_clean}", content=""))  # Only title, empty content
-
-        units.append(Unit(title=unit_title, content="", sub_units=sub_units))
-
-    logger.info(f"Regex extracted {len(units)} units.")
-
-    # Step 4: fallback / optional refinement with local LLM
-    if llm_instance:
-        try:
-            prompt = f"""
-Extract only the syllabus structure as JSON.
-Ignore sections after:
-- List of Tutorials
-- List of Practical
-- Evaluation System
-- Students’ Responsibilities
-- Prescribed Books and References
-
-Return format:
-{{ "units_data": [ {{ "title": "...", "content": "", "sub_units": [ {{ "title": "...", "content": "" }} ] }} ] }}
-
-Text:
----
-{syllabus_text}
----
-"""
-            output = llm_instance(prompt, stop=["```", "</s>"])
-            data = json.loads(output)
-            units_data = data.get("units_data", [])
-
-            if units_data:
-                refined = [
-                    Unit(
-                        title=u.get("title", ""),
-                        content=u.get("content", ""),
-                        sub_units=[
-                            SubUnit(title=s.get("title", ""), content=s.get("content", ""))
-                            for s in u.get("sub_units", [])
-                        ],
-                    )
-                    for u in units_data
-                ]
-                logger.info(f"Local LLM extracted {len(refined)} refined units.")
-                return SyllabusStructure(units_data=refined)
-        except Exception as e:
-            logger.warning(f"Local LLM extraction failed: {e}")
-
-    logger.info("Using regex extracted syllabus structure as fallback.")
-    return SyllabusStructure(units_data=units)
+        logger.error(f"Unexpected error during Gemini LLM extraction: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Gemini LLM extraction failed: {e}")
 
 
 def process_document_and_add_to_chroma(file_path: Path, filename: str, syllabus_id: str):
+    """
+    Processes a document (PDF only), extracts text, splits it into chunks,
+    adds to ChromaDB with associated metadata (syllabus_id), and uses AI (Gemini)
+    for structured unit/sub-unit extraction.
+    """
     file_type = get_file_type(str(file_path))
     logger.info(f"Processing file: {filename} with detected type: {file_type}")
 
@@ -336,7 +251,6 @@ def process_document_and_add_to_chroma(file_path: Path, filename: str, syllabus_
         )
 
     raw_text = extract_text_from_pdf(str(file_path))
-    clean_text = preprocess_syllabus_text(raw_text)
 
     if not raw_text.strip():
         logger.warning(f"Extracted no meaningful text from {filename}. Skipping further processing.")
@@ -344,6 +258,7 @@ def process_document_and_add_to_chroma(file_path: Path, filename: str, syllabus_
 
     logger.info(f"Raw text extracted from {filename} (first 500 chars):\n{raw_text[:500]}...")
 
+    # Split text into chunks for the vector store
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=200,
@@ -353,8 +268,11 @@ def process_document_and_add_to_chroma(file_path: Path, filename: str, syllabus_
     texts = text_splitter.split_text(raw_text)
     logger.info(f"Split {filename} into {len(texts)} chunks for vector store.")
 
+    # Add texts to ChromaDB with metadata
     try:
+        # Create metadata for each chunk, including the syllabus_id
         metadatas = [{"syllabus_id": syllabus_id, "source_filename": filename} for _ in texts]
+
         vector_store.add_texts(texts, metadatas=metadatas)
         vector_store.persist()
         logger.info(f"Successfully added {len(texts)} chunks from {filename} to ChromaDB with syllabus_id: {syllabus_id}.")
@@ -362,19 +280,16 @@ def process_document_and_add_to_chroma(file_path: Path, filename: str, syllabus_
         logger.error(f"Error adding chunks to ChromaDB for {filename} (syllabus_id: {syllabus_id}): {e}")
         raise HTTPException(status_code=500, detail=f"Error processing document for knowledge base: {e}")
 
-    # Ensure LLM is loaded before attempting to extract syllabus structure
-    llm_instance = get_llama_model()
-    if llm_instance is None:
-        logger.error("Local LLM model is not available for syllabus structure extraction.")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Local LLM model failed to load during startup. Please check server logs for details."
-        )
-
+    # Use LLM for structured syllabus extraction AFTER document is in Chroma
     try:
-        syllabus_structure_obj = extract_syllabus_structure_with_local_model(clean_text, llm_instance=llm_instance)
+        if extraction_llm is None:
+            raise HTTPException(
+                status_code=500,
+                detail="AI extraction LLM (Gemini) is not initialized. Please ensure GEMINI_API_KEY is set in .env."
+            )
+        syllabus_structure_obj = extract_syllabus_structure_with_llm(raw_text)
         parsed_units_data = syllabus_structure_obj.units_data
-        logger.info(f"Local LLM extracted {len(parsed_units_data)} main units from {filename} (syllabus_id: {syllabus_id}).")
+        logger.info(f"LLM extracted {len(parsed_units_data)} main units from {filename} (syllabus_id: {syllabus_id}).")
         return {
             "message": "File processed, added to knowledge base, and syllabus structure extracted.",
             "filename": filename,
@@ -382,16 +297,23 @@ def process_document_and_add_to_chroma(file_path: Path, filename: str, syllabus_
             "units_data": [unit.model_dump() for unit in parsed_units_data],
             "syllabus_id": syllabus_id
         }
-    except HTTPException as e: # Re-raise if it's an HTTPException from deep within
+    except HTTPException as e:
         raise e
     except Exception as e:
-        logger.error(f"Failed to extract syllabus structure using Local LLM: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to extract syllabus structure using Local LLM: {e}")
+        logger.error(f"Failed to extract syllabus structure using LLM: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to extract syllabus structure using AI (Gemini): {e}")
+
 
 # --- API Endpoints ---
 
 @app.post("/process-syllabus/", summary="Upload and process a syllabus (PDF) to build the knowledge base and extract chapters.")
 async def process_syllabus(file: UploadFile = File(...)):
+    """
+    Uploads a syllabus PDF file, extracts text, splits it into chunks,
+    adds it to the ChromaDB knowledge base with a unique syllabus_id,
+    and uses AI (Gemini) to identify main units and their full content,
+    including nested sub-units.
+    """
     if file.content_type != "application/pdf":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -410,256 +332,193 @@ async def process_syllabus(file: UploadFile = File(...)):
         return JSONResponse(status_code=status.HTTP_200_OK, content=result)
     except Exception as e:
         logger.error(f"Error processing syllabus file (syllabus_id: {current_syllabus_id}): {e}", exc_info=True)
-        # Check if it's already an HTTPException (e.g., from process_document_and_add_to_chroma)
-        if isinstance(e, HTTPException):
-            raise e
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to process syllabus: {e}")
     finally:
         if file_location.exists():
             os.remove(file_location)
             logger.info(f"Temporary file '{file.filename}' (syllabus_id: {current_syllabus_id}) removed.")
 
-@app.post(
-    "/generate-notes/",
-    response_model=NoteLinksResponse,
-    summary="Generate top 3 best note links by comparing syllabus context with internet search and LLM validation"
-)
+@app.post("/generate-notes/", response_model=GeneratedNotesList, summary="Generate study notes for selected topics using AI and the processed syllabus or internet search.")
 async def generate_notes(request: GenerateNotesRequest):
+    """
+    Generates study notes/resources based on a list of provided topic titles.
+    Notes can be sourced from the uploaded syllabus (RAG) or from an internet search (via Google Search API),
+    with the content then synthesized by a Gemini LLM into structured notes.
+    """
     topics = request.topics
     syllabus_id = request.syllabus_id
     source_type = request.source_type
 
     if not topics:
-        raise HTTPException(status_code=400, detail="No topics provided.")
-    if source_type == "syllabus" and not syllabus_id:
-        raise HTTPException(status_code=400, detail="syllabus_id is required when using syllabus source.")
-    if Google_Search is None:
-        raise HTTPException(status_code=500, detail="Google Search API is not initialized. Check GOOGLE_API_KEY and GOOGLE_CSE_ID in your .env file.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No topics provided for note generation.")
 
-    llm = get_llama_model()
-    if llm is None:
-        raise HTTPException(status_code=503, detail="Local LLM model is not available.")
+    if notes_generation_llm is None:
+        raise HTTPException(
+            status_code=500,
+            detail="AI note generation LLM (Gemini) is not initialized. Please ensure GEMINI_API_KEY is set."
+        )
 
-    generated_links = []
+    all_generated_notes = []
 
-    for topic in topics:
-        try:
-            # 1. get syllabus context
-            syllabus_context = topic
-            if source_type == "syllabus" and syllabus_id:
-                docs = vector_store.similarity_search(query=topic, k=3, filter={"syllabus_id": syllabus_id})
-                if docs:
-                    syllabus_context = "\n".join([doc.page_content for doc in docs]).strip()
-                else:
-                    logger.warning(f"No relevant chunks found for topic '{topic}'. Using topic as context.")
+    # Define the prompt for note generation using LLM synthesis
+    notes_prompt_template = """
+    You are an AI assistant specialized in generating concise study notes and relevant resource suggestions for academic topics.
+    Given a specific topic and its context, your task is to:
+    1. Create a compelling, brief title for a study resource related to the topic.
+    2. Write a short, informative snippet (1-2 sentences) summarizing the key takeaway or purpose of the resource.
+    3. Provide a placeholder URL. Use a relevant placeholder like "https://example.com/resource/{{topic_slug}}" or if search results provide a good URL, use that.
+    4. Categorize the source. Use 'educational', 'github', 'article', 'video', or 'web_search' for internet results, 'syllabus_excerpt' for syllabus results.
 
-            # 2. get search results
-            search_results_raw = Google_Search.results(topic, num_results=10)
-            search_results = [res for res in search_results_raw if res.get('link') and res.get('snippet')]
+    Generate ONE highly relevant resource for the following topic based on the context provided.
+    Ensure the output strictly adheres to the JSON schema for 'GeneratedNote'.
 
-            # 3. compute similarity
-            syllabus_embedding = embeddings.embed_query(syllabus_context)
-            scored_results = []
-            for res in search_results:
-                snippet = f"{res.get('title','')} {res.get('snippet','')}"
-                external_embedding = embeddings.embed_query(snippet)
-                score = cosine_similarity(syllabus_embedding, external_embedding)
-                scored_results.append((score, res))
+    Topic: {topic_title}
 
-            # sort by similarity
-            scored_results.sort(key=lambda x: x[0], reverse=True)
-            top_results = scored_results[:10]  # take top 10 for validation
+    Context:
+    ---
+    {context}
+    ---
 
-            validated_links = []
-            for score, res in top_results:
-                snippet = res.get('snippet', '')
-                url = res.get('link', '#')
+    Now, generate the resource for the given Topic and Context.
+    """
 
-                # optional: skip non-edu
-                if not (".edu" in url or ".ac." in url):
-                    continue
-
-                # 4. validate with local LLM
-                prompt = f"""
-We found this snippet for topic '{topic}': 
-
-\"{snippet}\"
-
-Is this snippet useful and relevant for a university student learning '{topic}'? Answer strictly with yes or no.
-"""
-                try:
-                    answer = llm(prompt, stop=["```", "</s>"]).strip().lower()
-                    logger.debug(f"Validation answer for topic '{topic}': {answer}")
-                    if "yes" in answer or "useful" in answer:
-                        validated_links.append(NoteLink(
-                            topic=topic,
-                            title=res.get('title', f"Result for {topic}"),
-                            snippet=snippet,
-                            url=url,
-                            similarity_score=round(score, 3)
-                        ))
-                except Exception as e:
-                    logger.error(f"Validation failed for topic '{topic}': {e}")
-
-            # Always return 3 notes per topic
-            notes_for_topic = []
-            # Add up to 3 validated links
-            notes_for_topic.extend(validated_links[:3])
-            # If less than 3, fill with top scoring results (even if not validated)
-            if len(notes_for_topic) < 3:
-                # Get the top results not already in validated_links
-                used_urls = set(n.url for n in notes_for_topic)
-                for score, res in top_results:
-                    url = res.get('link', '#')
-                    if url in used_urls:
-                        continue
-                    notes_for_topic.append(NoteLink(
-                        topic=topic,
-                        title=res.get('title', f"Result for {topic}"),
-                        snippet=res.get('snippet', ''),
-                        url=url,
-                        similarity_score=round(score, 3)
-                    ))
-                    used_urls.add(url)
-                    if len(notes_for_topic) == 3:
-                        break
-            # If still less than 3, add placeholders
-            while len(notes_for_topic) < 3:
-                notes_for_topic.append(NoteLink(
-                    topic=topic,
-                    title="No internet notes found",
-                    snippet="",
-                    url="#",
-                    similarity_score=0
-                ))
-            generated_links.extend(notes_for_topic)
-
-        except Exception as e:
-            logger.error(f"Error generating note for topic '{topic}': {e}", exc_info=True)
-            for _ in range(3):
-                generated_links.append(NoteLink(
-                    topic=topic,
-                    title=f"Error generating note for {topic}",
-                    snippet=f"Unexpected error: {e}",
-                    url="#error",
-                    similarity_score=0
-                ))
-
-    return NoteLinksResponse(notes=generated_links)
-
-@app.post("/generate-ai-notes/")
-async def generate_ai_notes(request: GenerateNotesRequest):
-    topics = request.topics
-    syllabus_id = request.syllabus_id
-    source_type = request.source_type
-
-    if not topics:
-        raise HTTPException(status_code=400, detail="No topics provided.")
-    if source_type == "syllabus" and not syllabus_id:
-        raise HTTPException(status_code=400, detail="syllabus_id is required when source_type is 'syllabus'.")
-
-    result_links = []
+    notes_prompt = ChatPromptTemplate.from_template(notes_prompt_template)
+    note_generation_chain = notes_prompt | notes_generation_llm.with_structured_output(GeneratedNote)
 
     for topic in topics:
+        context_text = ""
+        source_category = ""
+        # Initialize primary_url for potential Google Search fallback
+        primary_url = ""
+
         try:
-            # 1. Get context
-            syllabus_context = topic
-            if source_type == "syllabus" and syllabus_id:
-                docs = vector_store.similarity_search(
-                    query=topic, k=3, filter={"syllabus_id": syllabus_id}
+            if source_type == "syllabus":
+                if not syllabus_id:
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Syllabus ID is required when source_type is 'syllabus'.")
+
+                logger.info(f"Retrieving context for topic: '{topic}' from ChromaDB with syllabus_id: {syllabus_id}.")
+                retrieved_docs = vector_store.similarity_search(
+                    query=topic,
+                    k=3,
+                    filter={"syllabus_id": syllabus_id}
                 )
-                if docs:
-                    syllabus_context = "\n".join([doc.page_content for doc in docs]).strip()
+                context_text = "\n".join([doc.page_content for doc in retrieved_docs])
+                source_category = "syllabus_excerpt"
+
+                # If no meaningful context from syllabus, try a general web search for context as well
+                if not context_text.strip() and Google_Search:
+                    logger.warning(f"No strong syllabus context for '{topic}'. Attempting web search for general context.")
+                    search_query = f"{topic} overview"
+                    web_context_results = Google_Search.run(search_query)
+                    context_text += "\n\nWeb Search for Context:\n" + web_context_results
+                    source_category = "web_search" # Change source if primarily using web context
+
+            elif source_type == "internet":
+                if Google_Search is None:
+                    raise HTTPException(status_code=500, detail="Google Search API is not initialized. Check GOOGLE_API_KEY and GOOGLE_CSE_ID in .env.")
+
+                logger.info(f"Performing internet search for topic: '{topic}'.")
+                search_query = f"{topic} study notes"
+                search_results_str = Google_Search.run(search_query)
+
+                context_text = "Internet Search Results:\n" + search_results_str
+                source_category = "web_search"
+
+                # Try to extract the first URL directly from the search results for internet source
+                match = re.search(r'\[(https?://\S+)\]', search_results_str)
+                if match:
+                    primary_url = match.group(1)
                 else:
-                    syllabus_context = "This is a computer science topic. Generate helpful study notes."
+                    primary_url = f"https://www.google.com/search?q={topic.replace(' ', '+')}"
 
-            # 2. Build prompt
-            prompt = f"""
-You are a subject expert writing study notes.
 
-Instructions:
-- Write clear, structured notes in paragraph form.
-- Start with a definition or overview.
-- Explain subtopics or concepts with short examples.
-- Avoid lists or markdown formatting unless necessary.
-- Write in a tone suited for a university-level student.
-- Do NOT include any meta-text like "Your task is..." or "Textbook:".
+            if not context_text.strip():
+                logger.warning(f"No relevant context found for topic: '{topic}' from {source_type}. Generating a general placeholder note.")
+                generated_note = GeneratedNote(
+                    topicTitle=topic,
+                    title=f"No Context Found for {topic}",
+                    snippet=f"Unable to find specific content for '{topic}' from the selected source ({source_type}). This note provides general information only.",
+                    url=f"https://www.google.com/search?q={topic.replace(' ', '+')}", # Fallback to Google Search
+                    source="general"
+                )
+            else:
+                logger.info(f"Generating note for topic: '{topic}' with context from {source_type}.")
+                generated_note = note_generation_chain.invoke({
+                    "topic_title": topic,
+                    "context": context_text,
+                })
 
-Context (optional for reference):
-{syllabus_context}
+                # --- NEW LOGIC FOR URL HANDLING ---
+                # Override the AI-generated URL if we have a better one from direct search,
+                # or if the AI generated a generic example.
+                if source_type == "internet" and primary_url:
+                    generated_note.url = primary_url
+                elif Google_Search: # For syllabus source, or if AI gave a placeholder, try a targeted search
+                    # Only attempt to override if current URL is a generic placeholder, or if it's syllabus source
+                    is_placeholder = generated_note.url.startswith("https://example.com/") or \
+                                     "topic_slug" in generated_note.url # Check for old placeholder
+                    if source_type == "syllabus" or is_placeholder:
+                        try:
+                            logger.info(f"Performing targeted internet search for URL for '{topic}'.")
+                            url_search_query = f"{topic} documentation tutorial explanation"
+                            url_search_results = Google_Search.run(url_search_query)
+                            url_match = re.search(r'\[(https?://\S+)\]', url_search_results)
+                            if url_match:
+                                generated_note.url = url_match.group(1)
+                                generated_note.source = "web_search_supplement" # Indicate URL came from web search
+                            else:
+                                # Fallback to a general Google Search if no specific URL found
+                                generated_note.url = f"https://www.google.com/search?q={topic.replace(' ', '+')}"
+                        except Exception as url_e:
+                            logger.warning(f"Failed to get targeted URL for '{topic}': {url_e}")
+                            generated_note.url = f"https://www.google.com/search?q={topic.replace(' ', '+')}"
+                else: # If Google Search is not configured, fallback to generic search URL
+                    generated_note.url = f"https://www.google.com/search?q={topic.replace(' ', '+')}"
+                # --- END NEW LOGIC ---
 
-Please begin the notes below:
-"""
+                # Ensure source is correctly categorized if it was overridden for URL
+                if generated_note.source == "web_search_supplement":
+                    # If we used web search just for the URL, original context was still syllabus
+                    generated_note.source = "syllabus_excerpt_with_web_link" # New source type
+                elif source_type == "internet" and generated_note.source != "web_search":
+                    generated_note.source = "web_search" # Ensure consistency
 
-            # 3. Call Ollama Llama 3
-            output = call_ollama_llama3(prompt)
 
-            output = output.strip()
+            all_generated_notes.append(generated_note)
 
-            # 4. Fallback for short or empty output
-            if len(output.split()) < 20:
-                logger.warning(f"Short or empty output for topic '{topic}':\n{output}")
-                output = f"(⚠️ Auto-generated note is too brief or unavailable for topic: '{topic}')"
-
-            # 5. Save to file
-            note_id = str(uuid.uuid4())
-            filename = f"{note_id}.md"
-            note_path = NOTES_DIR / filename
-
-            with open(note_path, "w", encoding="utf-8") as f:
-                f.write(f"# Notes for {topic}\n\n{output}\n")
-
-            # 6. Add to result
-            result_links.append({
-                "topic": topic,
-                "note_id": note_id,
-                "download_url": f"/download-note/{note_id}"
-            })
-
+        except ValidationError as e:
+            logger.error(f"Pydantic validation failed for generated note for topic '{topic}': {e}", exc_info=True)
+            all_generated_notes.append(GeneratedNote(
+                topicTitle=topic,
+                title=f"Error generating note for {topic}",
+                snippet=f"Could not generate a structured note due to AI output format issues. Error: {e.errors()[0]['msg']}",
+                url="#error",
+                source="error"
+            ))
+        except HTTPException as e:
+            logger.error(f"HTTPException during note generation for topic '{topic}': {e.detail}", exc_info=True)
+            all_generated_notes.append(GeneratedNote(
+                topicTitle=topic,
+                title=f"Error generating note for {topic}",
+                snippet=f"An API error occurred: {e.detail}",
+                url="#error",
+                source="error"
+            ))
         except Exception as e:
-            logger.error(f"Failed to generate notes for topic '{topic}': {e}", exc_info=True)
-            result_links.append({
-                "topic": topic,
-                "note_id": None,
-                "error": str(e)
-            })
+            logger.error(f"Unexpected error during note generation for topic '{topic}': {e}", exc_info=True)
+            all_generated_notes.append(GeneratedNote(
+                topicTitle=topic,
+                title=f"Error generating note for {topic}",
+                snippet=f"An unexpected error occurred: {e}",
+                url="#error",
+                source="error"
+            ))
 
-    return result_links
-
-@app.get("/download-note/{note_id}", summary="Download a generated note by ID")
-def download_note(note_id: str):
-    file_path = NOTES_DIR / f"{note_id}.md"
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Note not found.")
-    return FileResponse(file_path, media_type="text/markdown", filename=f"{note_id}.md")
+    return GeneratedNotesList(notes=all_generated_notes)
 
 
 @app.get("/", include_in_schema=False)
 async def read_root():
     return {"message": "NoteMate Backend is running. Access /docs for API documentation."}
 
-def call_ollama_llama3(prompt: str, model: str = "llama3", base_url: str = "http://localhost:11434/api/generate") -> str:
-    """
-    Calls Ollama's Llama 3 API with the given prompt and returns the generated text.
-    """
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False
-    }
-    try:
-        response = requests.post(base_url, json=payload, timeout=120)
-        response.raise_for_status()
-        data = response.json()
-        # Ollama returns the result in 'response' or 'message' or 'text'
-        if "response" in data:
-            return data["response"].strip()
-        elif "message" in data:
-            return data["message"].strip()
-        elif "text" in data:
-            return data["text"].strip()
-        else:
-            raise ValueError(f"Unexpected Ollama response format: {data}")
-    except Exception as e:
-        logger.error(f"Ollama Llama 3 call failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Ollama Llama 3 call failed: {e}")
+# To run this backend: uvicorn main:app --reload --port 8000
