@@ -1,55 +1,37 @@
-# main.py
-
-from fastapi import FastAPI, UploadFile, File, HTTPException, status
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, ValidationError
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import List, Optional, Dict, Any, Literal
 import os
 import shutil
-import magic
-from pathlib import Path
 import logging
 import re
-import json
 import uuid
+from typing import Optional, List, Literal
+from pathlib import Path
+
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Document Loaders for text extraction
 from PyPDF2 import PdfReader
 
 # LangChain components for text splitting, embeddings, vector store, LLM
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import SentenceTransformerEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
+from langchain_google_vertexai import VertexAIEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
-from pydantic import BaseModel as LCBaseModel
-from pydantic import Field as LCField
+from langchain_core.documents import Document
+from langchain_core.pydantic_v1 import BaseModel as LCBaseModel, Field as LCField
 
 # Google Search Tool
 from langchain_community.utilities import GoogleSearchAPIWrapper
-from langchain_core.messages import HumanMessage
-
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Pydantic Schemas for AI Extraction Output (Syllabus Structure) ---
-class SubUnit(LCBaseModel):
-    title: str = LCField(description="The title of the sub-unit, e.g., '1.1 Types', '2.3 Interprocess Communication'.")
-    content: str = LCField(description="The full textual content of this sub-unit.")
-
-class Unit(LCBaseModel):
-    title: str = LCField(description="The title of the main unit, e.g., 'Unit 1: Introduction', 'Chapter 2: Processes'.")
-    content: str = LCField(description="The full textual content of this main unit, excluding content explicitly within its sub-units. Can be empty if all content is within sub-units.")
-    sub_units: List[SubUnit] = LCField(default_factory=list, description="A list of sub-units within this main unit.")
-
-class SyllabusStructure(LCBaseModel):
-    units_data: List[Unit] = LCField(description="A list of main units found in the syllabus, each with its title, content, and nested sub-units.")
-
-# --- Pydantic Schemas for AI Generated Notes Output ---
+# --- Pydantic Schemas ---
 class GeneratedNote(LCBaseModel):
     topicTitle: str = LCField(description="The main topic/chapter title this note relates to (e.g., 'Introduction to React').")
     title: str = LCField(description="A concise title for the generated resource/note (e.g., 'Official React Docs').")
@@ -60,7 +42,6 @@ class GeneratedNote(LCBaseModel):
 class GeneratedNotesList(LCBaseModel):
     notes: List[GeneratedNote] = LCField(description="A list of generated notes/resources for the given topics.")
 
-# --- Pydantic Schema for Generate Notes Request ---
 class GenerateNotesRequest(BaseModel):
     topics: List[str] = Field(description="List of topic titles for which to generate notes.")
     syllabus_id: Optional[str] = Field(
@@ -72,17 +53,17 @@ class GenerateNotesRequest(BaseModel):
         description="Specifies where to find the notes: 'syllabus' (from uploaded PDF) or 'internet' (using Google Search)."
     )
 
-
 # --- Settings Management ---
 class Settings(BaseSettings):
     chroma_db_path: str = "./chroma_db"
     supported_file_types: List[str] = ["application/pdf"]
     upload_dir: str = "uploaded_files"
-
+    
     gemini_api_key: Optional[str] = None
-    gemini_extraction_model_name: str = "gemini-1.5-flash"
     gemini_notes_generation_model_name: str = "gemini-1.5-flash"
-
+    
+    gcp_project_id: Optional[str] = None
+    
     google_api_key: Optional[str] = None
     google_cse_id: Optional[str] = None
 
@@ -100,28 +81,25 @@ except OSError as e:
     exit(1)
 
 # --- LangChain Components Initialization ---
-embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
-logger.info("SentenceTransformerEmbeddings model 'all-MiniLM-L6-v2' initialized.")
-
-vector_store = Chroma(persist_directory=settings.chroma_db_path, embedding_function=embeddings)
-logger.info(f"ChromaDB initialized, persistent directory: {settings.chroma_db_path}")
-
-
-# Initialize Gemini LLM for Extraction
-extraction_llm = None
-if settings.gemini_api_key:
-    extraction_llm = ChatGoogleGenerativeAI(
-        model=settings.gemini_extraction_model_name,
-        temperature=0.1,
-        google_api_key=settings.gemini_api_key,
-        convert_system_message_to_human=True
-    )
-    logger.info(f"Extraction LLM (Gemini) initialized with model: {settings.gemini_extraction_model_name}")
-else:
-    logger.error("Gemini API key is missing. AI syllabus extraction will be disabled.")
-
-# Initialize Gemini LLM for Notes Generation (can be the same model or different)
+embeddings = None
+vector_store = None
 notes_generation_llm = None
+Google_Search = None
+
+if settings.gcp_project_id:
+    try:
+        embeddings = VertexAIEmbeddings(
+            model_name="text-embedding-gecko@001",
+            project=settings.gcp_project_id
+        )
+        vector_store = Chroma(
+            persist_directory=settings.chroma_db_path,
+            embedding_function=embeddings
+        )
+        logger.info("VertexAIEmbeddings and ChromaDB initialized.")
+    except Exception as e:
+        logger.critical(f"Failed to initialize VertexAIEmbeddings/ChromaDB: {e}", exc_info=True)
+
 if settings.gemini_api_key:
     notes_generation_llm = ChatGoogleGenerativeAI(
         model=settings.gemini_notes_generation_model_name,
@@ -129,12 +107,8 @@ if settings.gemini_api_key:
         google_api_key=settings.gemini_api_key,
         convert_system_message_to_human=True
     )
-    logger.info(f"Notes Generation LLM (Gemini) initialized with model: {settings.gemini_notes_generation_model_name}")
-else:
-    logger.error("Gemini API key is missing. AI note generation will be disabled.")
+    logger.info("Gemini LLM for notes generation initialized.")
 
-# --- Initialize Google Search Tool ---
-Google_Search = None
 if settings.google_api_key and settings.google_cse_id:
     os.environ["GOOGLE_API_KEY"] = settings.google_api_key
     os.environ["GOOGLE_CSE_ID"] = settings.google_cse_id
@@ -142,28 +116,18 @@ if settings.google_api_key and settings.google_cse_id:
         Google_Search = GoogleSearchAPIWrapper()
         logger.info("Google Search API Wrapper initialized.")
     except Exception as e:
-        logger.error(f"Failed to initialize Google Search API Wrapper: {e}. Check GOOGLE_API_KEY and GOOGLE_CSE_ID.", exc_info=True)
+        logger.error(f"Failed to initialize Google Search API: {e}")
         Google_Search = None
 else:
-    logger.warning("Google API Key or CSE ID missing. Internet search functionality will be unavailable.")
-
+    logger.warning("Google API Key or CSE ID missing. Internet search will be unavailable.")
 
 app = FastAPI(
     title="NoteMate Backend - Syllabus & Notes Processor",
-    description="API for uploading and processing PDF syllabuses, and generating study notes from selected chapters using AI.",
+    description="API for uploading and processing PDF syllabuses, and generating study notes.",
     version="0.1.0"
 )
 
-# Configure CORS to allow requests from your React frontend
-origins = [
-    "http://localhost",
-    "http://localhost:3000",
-    "http://127.0.0.1",
-    "http://127.0.0.1:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
-
+origins = ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -172,11 +136,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Helper Functions for Document Processing and AI Interaction ---
 
-def get_file_type(file_path: str) -> str:
-    return magic.from_file(file_path, mime=True)
-
+# --- Helper Functions for Document Processing ---
 def extract_text_from_pdf(pdf_path: str) -> str:
     text = ""
     try:
@@ -189,178 +150,65 @@ def extract_text_from_pdf(pdf_path: str) -> str:
         raise HTTPException(status_code=500, detail=f"Error extracting text from PDF: {e}")
     return text
 
-def extract_syllabus_structure_with_llm(syllabus_text: str) -> SyllabusStructure:
-    """
-    Extracts units and sub-units from syllabus text using a Gemini LLM.
-    """
-    if extraction_llm is None:
-        raise HTTPException(
-            status_code=500,
-            detail="AI extraction LLM (Gemini) is not initialized. Please ensure GEMINI_API_KEY is set in .env."
-        )
-
-    prompt_template = """
-    You are an expert syllabus parser. Your task is to extract the main units and their sub-units from the provided syllabus text.
-    Identify main units by clear headers like "Unit X:", "Chapter Y:", or "Module Z:".
-    Within each main unit, identify sub-units by numerical patterns like "1.1", "1.2.3", etc.
-
-    For each unit and sub-unit, extract its exact title and its full textual content.
-    The 'content' field for a unit/sub-unit should include all text from its title line up to the next unit/sub-unit title, or the end of its enclosing section.
-    If a unit/sub-unit has no further specific content (e.g., only contains nested sub-units), its 'content' field should be an empty string.
-
-    If no units or sub-units are found, return an empty list for 'units_data'.
-
-    Syllabus Text:
-    ---
-    {syllabus_text}
-    ---
-    """
-
-    prompt = ChatPromptTemplate.from_template(prompt_template)
-
-    # Use .with_structured_output to ensure Pydantic model adherence
-    extraction_chain = prompt | extraction_llm.with_structured_output(SyllabusStructure)
-
-    try:
-        syllabus_structure = extraction_chain.invoke({"syllabus_text": syllabus_text})
-        logger.info("Successfully parsed syllabus structure with Gemini LLM.")
-        return syllabus_structure
-
-    except ValidationError as e:
-        logger.error(f"Pydantic validation failed for LLM output: {e}", exc_info=True)
-        # More detailed error for debugging
-        raise HTTPException(status_code=500, detail=f"LLM extraction failed: Invalid structure from AI. Error: {e.errors()}")
-    except Exception as e:
-        logger.error(f"Unexpected error during Gemini LLM extraction: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Gemini LLM extraction failed: {e}")
-
-
 def process_document_and_add_to_chroma(file_path: Path, filename: str, syllabus_id: str):
-    """
-    Processes a document (PDF only), extracts text, splits it into chunks,
-    adds to ChromaDB with associated metadata (syllabus_id), and uses AI (Gemini)
-    for structured unit/sub-unit extraction.
-    """
-    file_type = get_file_type(str(file_path))
-    logger.info(f"Processing file: {filename} with detected type: {file_type}")
-
-    if file_type not in settings.supported_file_types:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported file type: {file_type}. Only PDF files are supported."
-        )
+    if not vector_store:
+        raise HTTPException(status_code=500, detail="Vector store not initialized. Check server logs.")
 
     raw_text = extract_text_from_pdf(str(file_path))
 
     if not raw_text.strip():
-        logger.warning(f"Extracted no meaningful text from {filename}. Skipping further processing.")
-        return {"message": "File processed, but no significant text was extracted.", "filename": filename, "units_data": [], "syllabus_id": syllabus_id}
+        logger.warning(f"Extracted no meaningful text from {filename}. Skipping.")
+        return {"message": "File processed, but no significant text was extracted.", "syllabus_id": syllabus_id}
 
-    logger.info(f"Raw text extracted from {filename} (first 500 chars):\n{raw_text[:500]}...")
-
-    # Split text into chunks for the vector store
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len,
-        is_separator_regex=False,
-    )
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     texts = text_splitter.split_text(raw_text)
-    logger.info(f"Split {filename} into {len(texts)} chunks for vector store.")
-
-    # Add texts to ChromaDB with metadata
+    docs = [
+        Document(page_content=text, metadata={"syllabus_id": syllabus_id, "source_filename": filename})
+        for text in texts
+    ]
+    
     try:
-        # Create metadata for each chunk, including the syllabus_id
-        metadatas = [{"syllabus_id": syllabus_id, "source_filename": filename} for _ in texts]
-
-        vector_store.add_texts(texts, metadatas=metadatas)
+        vector_store.add_documents(docs)
         vector_store.persist()
-        logger.info(f"Successfully added {len(texts)} chunks from {filename} to ChromaDB with syllabus_id: {syllabus_id}.")
-    except Exception as e:
-        logger.error(f"Error adding chunks to ChromaDB for {filename} (syllabus_id: {syllabus_id}): {e}")
-        raise HTTPException(status_code=500, detail=f"Error processing document for knowledge base: {e}")
-
-    # Use LLM for structured syllabus extraction AFTER document is in Chroma
-    try:
-        if extraction_llm is None:
-            raise HTTPException(
-                status_code=500,
-                detail="AI extraction LLM (Gemini) is not initialized. Please ensure GEMINI_API_KEY is set in .env."
-            )
-        syllabus_structure_obj = extract_syllabus_structure_with_llm(raw_text)
-        parsed_units_data = syllabus_structure_obj.units_data
-        logger.info(f"LLM extracted {len(parsed_units_data)} main units from {filename} (syllabus_id: {syllabus_id}).")
+        logger.info(f"Added {len(docs)} chunks from {filename} to ChromaDB.")
         return {
-            "message": "File processed, added to knowledge base, and syllabus structure extracted.",
+            "message": "File processed and added to knowledge base.",
             "filename": filename,
-            "chunks_added": len(texts),
-            "units_data": [unit.model_dump() for unit in parsed_units_data],
+            "chunks_added": len(docs),
             "syllabus_id": syllabus_id
         }
-    except HTTPException as e:
-        raise e
     except Exception as e:
-        logger.error(f"Failed to extract syllabus structure using LLM: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to extract syllabus structure using AI (Gemini): {e}")
-
+        logger.error(f"Error adding chunks to ChromaDB for {filename}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error processing document: {e}")
 
 # --- API Endpoints ---
-
-@app.post("/process-syllabus/", summary="Upload and process a syllabus (PDF) to build the knowledge base and extract chapters.")
+@app.post("/process-syllabus/")
 async def process_syllabus(file: UploadFile = File(...)):
-    """
-    Uploads a syllabus PDF file, extracts text, splits it into chunks,
-    adds it to the ChromaDB knowledge base with a unique syllabus_id,
-    and uses AI (Gemini) to identify main units and their full content,
-    including nested sub-units.
-    """
     if file.content_type != "application/pdf":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported file type: {file.content_type}. Please upload a PDF file."
-        )
+        raise HTTPException(status_code=400, detail="Unsupported file type. Please upload a PDF file.")
 
-    current_syllabus_id = str(uuid.uuid4())
-    file_location = Path(settings.upload_dir) / f"{current_syllabus_id}_{file.filename}"
+    syllabus_id = str(uuid.uuid4())
+    file_location = Path(settings.upload_dir) / f"{syllabus_id}_{file.filename}"
 
     try:
         with open(file_location, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        logger.info(f"File '{file.filename}' saved to '{file_location}' with syllabus_id: {current_syllabus_id}")
-
-        result = process_document_and_add_to_chroma(file_location, file.filename, current_syllabus_id)
-        return JSONResponse(status_code=status.HTTP_200_OK, content=result)
+        
+        result = process_document_and_add_to_chroma(file_location, file.filename, syllabus_id)
+        return JSONResponse(status_code=200, content=result)
     except Exception as e:
-        logger.error(f"Error processing syllabus file (syllabus_id: {current_syllabus_id}): {e}", exc_info=True)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to process syllabus: {e}")
+        logger.error(f"Error processing syllabus: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to process syllabus: {e}")
     finally:
         if file_location.exists():
             os.remove(file_location)
-            logger.info(f"Temporary file '{file.filename}' (syllabus_id: {current_syllabus_id}) removed.")
 
-@app.post("/generate-notes/", response_model=GeneratedNotesList, summary="Generate study notes for selected topics using AI and the processed syllabus or internet search.")
+@app.post("/generate-notes/", response_model=GeneratedNotesList)
 async def generate_notes(request: GenerateNotesRequest):
-    """
-    Generates study notes/resources based on a list of provided topic titles.
-    Notes can be sourced from the uploaded syllabus (RAG) or from an internet search (via Google Search API),
-    with the content then synthesized by a Gemini LLM into structured notes.
-    """
-    topics = request.topics
-    syllabus_id = request.syllabus_id
-    source_type = request.source_type
-
-    if not topics:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No topics provided for note generation.")
-
-    if notes_generation_llm is None:
-        raise HTTPException(
-            status_code=500,
-            detail="AI note generation LLM (Gemini) is not initialized. Please ensure GEMINI_API_KEY is set."
-        )
-
+    if not notes_generation_llm:
+        raise HTTPException(status_code=500, detail="AI generation model not initialized. Check logs.")
+    
     all_generated_notes = []
-
-    # Define the prompt for note generation using LLM synthesis
     notes_prompt_template = """
     You are an AI assistant specialized in generating concise study notes and relevant resource suggestions for academic topics.
     Given a specific topic and its context, your task is to:
@@ -368,144 +216,75 @@ async def generate_notes(request: GenerateNotesRequest):
     2. Write a short, informative snippet (1-2 sentences) summarizing the key takeaway or purpose of the resource.
     3. Provide a placeholder URL. Use a relevant placeholder like "https://example.com/resource/{{topic_slug}}" or if search results provide a good URL, use that.
     4. Categorize the source. Use 'educational', 'github', 'article', 'video', or 'web_search' for internet results, 'syllabus_excerpt' for syllabus results.
-
+    
     Generate ONE highly relevant resource for the following topic based on the context provided.
     Ensure the output strictly adheres to the JSON schema for 'GeneratedNote'.
-
+    
     Topic: {topic_title}
-
+    
     Context:
     ---
     {context}
     ---
-
+    
     Now, generate the resource for the given Topic and Context.
     """
-
     notes_prompt = ChatPromptTemplate.from_template(notes_prompt_template)
-    note_generation_chain = notes_prompt | notes_generation_llm.with_structured_output(GeneratedNote)
-
-    for topic in topics:
+    
+    for topic in request.topics:
         context_text = ""
-        source_category = ""
-        # Initialize primary_url for potential Google Search fallback
         primary_url = ""
-
+        source_category = ""
+        
         try:
-            if source_type == "syllabus":
-                if not syllabus_id:
-                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Syllabus ID is required when source_type is 'syllabus'.")
+            if request.source_type == "syllabus":
+                if not request.syllabus_id:
+                    raise HTTPException(status_code=400, detail="Syllabus ID is required for 'syllabus' source type.")
+                if not vector_store:
+                    raise HTTPException(status_code=500, detail="Vector store not initialized. Check server logs.")
 
-                logger.info(f"Retrieving context for topic: '{topic}' from ChromaDB with syllabus_id: {syllabus_id}.")
-                retrieved_docs = vector_store.similarity_search(
-                    query=topic,
-                    k=3,
-                    filter={"syllabus_id": syllabus_id}
-                )
+                retrieved_docs = vector_store.similarity_search(query=topic, k=3, filter={"syllabus_id": request.syllabus_id})
                 context_text = "\n".join([doc.page_content for doc in retrieved_docs])
                 source_category = "syllabus_excerpt"
 
-                # If no meaningful context from syllabus, try a general web search for context as well
-                if not context_text.strip() and Google_Search:
-                    logger.warning(f"No strong syllabus context for '{topic}'. Attempting web search for general context.")
-                    search_query = f"{topic} overview"
-                    web_context_results = Google_Search.run(search_query)
-                    context_text += "\n\nWeb Search for Context:\n" + web_context_results
-                    source_category = "web_search" # Change source if primarily using web context
-
-            elif source_type == "internet":
-                if Google_Search is None:
-                    raise HTTPException(status_code=500, detail="Google Search API is not initialized. Check GOOGLE_API_KEY and GOOGLE_CSE_ID in .env.")
-
-                logger.info(f"Performing internet search for topic: '{topic}'.")
+            elif request.source_type == "internet":
+                if not Google_Search:
+                    raise HTTPException(status_code=500, detail="Google Search API is not initialized. Check your API keys.")
+                
                 search_query = f"{topic} study notes"
                 search_results_str = Google_Search.run(search_query)
-
                 context_text = "Internet Search Results:\n" + search_results_str
                 source_category = "web_search"
-
-                # Try to extract the first URL directly from the search results for internet source
+                
                 match = re.search(r'\[(https?://\S+)\]', search_results_str)
                 if match:
                     primary_url = match.group(1)
                 else:
                     primary_url = f"https://www.google.com/search?q={topic.replace(' ', '+')}"
 
-
+            # If no context, provide a default note
             if not context_text.strip():
-                logger.warning(f"No relevant context found for topic: '{topic}' from {source_type}. Generating a general placeholder note.")
                 generated_note = GeneratedNote(
                     topicTitle=topic,
                     title=f"No Context Found for {topic}",
-                    snippet=f"Unable to find specific content for '{topic}' from the selected source ({source_type}). This note provides general information only.",
-                    url=f"https://www.google.com/search?q={topic.replace(' ', '+')}", # Fallback to Google Search
+                    snippet=f"Unable to find specific content for '{topic}' from the selected source.",
+                    url=f"https://www.google.com/search?q={topic.replace(' ', '+')}",
                     source="general"
                 )
             else:
-                logger.info(f"Generating note for topic: '{topic}' with context from {source_type}.")
-                generated_note = note_generation_chain.invoke({
-                    "topic_title": topic,
-                    "context": context_text,
-                })
-
-                # --- NEW LOGIC FOR URL HANDLING ---
-                # Override the AI-generated URL if we have a better one from direct search,
-                # or if the AI generated a generic example.
-                if source_type == "internet" and primary_url:
+                note_generation_chain = notes_prompt | notes_generation_llm.with_structured_output(GeneratedNote)
+                generated_note = note_generation_chain.invoke({"topic_title": topic, "context": context_text})
+                
+                if primary_url:
                     generated_note.url = primary_url
-                elif Google_Search: # For syllabus source, or if AI gave a placeholder, try a targeted search
-                    # Only attempt to override if current URL is a generic placeholder, or if it's syllabus source
-                    is_placeholder = generated_note.url.startswith("https://example.com/") or \
-                                     "topic_slug" in generated_note.url # Check for old placeholder
-                    if source_type == "syllabus" or is_placeholder:
-                        try:
-                            logger.info(f"Performing targeted internet search for URL for '{topic}'.")
-                            url_search_query = f"{topic} documentation tutorial explanation"
-                            url_search_results = Google_Search.run(url_search_query)
-                            url_match = re.search(r'\[(https?://\S+)\]', url_search_results)
-                            if url_match:
-                                generated_note.url = url_match.group(1)
-                                generated_note.source = "web_search_supplement" # Indicate URL came from web search
-                            else:
-                                # Fallback to a general Google Search if no specific URL found
-                                generated_note.url = f"https://www.google.com/search?q={topic.replace(' ', '+')}"
-                        except Exception as url_e:
-                            logger.warning(f"Failed to get targeted URL for '{topic}': {url_e}")
-                            generated_note.url = f"https://www.google.com/search?q={topic.replace(' ', '+')}"
-                else: # If Google Search is not configured, fallback to generic search URL
-                    generated_note.url = f"https://www.google.com/search?q={topic.replace(' ', '+')}"
-                # --- END NEW LOGIC ---
-
-                # Ensure source is correctly categorized if it was overridden for URL
-                if generated_note.source == "web_search_supplement":
-                    # If we used web search just for the URL, original context was still syllabus
-                    generated_note.source = "syllabus_excerpt_with_web_link" # New source type
-                elif source_type == "internet" and generated_note.source != "web_search":
-                    generated_note.source = "web_search" # Ensure consistency
-
+                generated_note.source = source_category
 
             all_generated_notes.append(generated_note)
 
-        except ValidationError as e:
-            logger.error(f"Pydantic validation failed for generated note for topic '{topic}': {e}", exc_info=True)
-            all_generated_notes.append(GeneratedNote(
-                topicTitle=topic,
-                title=f"Error generating note for {topic}",
-                snippet=f"Could not generate a structured note due to AI output format issues. Error: {e.errors()[0]['msg']}",
-                url="#error",
-                source="error"
-            ))
         except HTTPException as e:
-            logger.error(f"HTTPException during note generation for topic '{topic}': {e.detail}", exc_info=True)
-            all_generated_notes.append(GeneratedNote(
-                topicTitle=topic,
-                title=f"Error generating note for {topic}",
-                snippet=f"An API error occurred: {e.detail}",
-                url="#error",
-                source="error"
-            ))
+            raise e
         except Exception as e:
-            logger.error(f"Unexpected error during note generation for topic '{topic}': {e}", exc_info=True)
+            logger.error(f"Error during note generation for topic '{topic}': {e}", exc_info=True)
             all_generated_notes.append(GeneratedNote(
                 topicTitle=topic,
                 title=f"Error generating note for {topic}",
@@ -516,9 +295,6 @@ async def generate_notes(request: GenerateNotesRequest):
 
     return GeneratedNotesList(notes=all_generated_notes)
 
-
-@app.get("/", include_in_schema=False)
-async def read_root():
-    return {"message": "NoteMate Backend is running. Access /docs for API documentation."}
-
-# To run this backend: uvicorn main:app --reload --port 8000
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=10000)
